@@ -1,0 +1,1002 @@
+###############################################################################
+# RRH RECIDIVISM MODELING SCRIPT
+#
+# PURPOSE:
+# This script takes the finished RRH modeling dataset and prepares it for
+# predictive modeling in tidymodels.
+#
+# IMPORTANT:
+# This script does NOT build the dataset from raw data.
+# It assumes you already created:
+#
+#   rrh_recidivism_modeling_dataset.csv
+#
+# using your separate dataset-building script.
+#
+# WHY KEEP THIS AS A SEPARATE SCRIPT?
+# 1. Your dataset-building process is one workflow
+# 2. Your modeling process is a second workflow
+# 3. This makes debugging, updating, and re-running much easier
+#
+# OVERVIEW:
+# 1. Load the finished RRH dataset
+# 2. Convert the outcome into a factor for classification
+# 3. Convert categorical predictors into factors
+# 4. Remove ID/date/text fields that should not be modeled
+# 5. Inspect the final modeling table
+# 6. Create train/test split
+# 7. Create cross-validation folds
+# 8. Build preprocessing blueprints
+# 9. Define metrics
+#
+# NOTE:
+# This script stops after preprocessing setup.
+# You can then add logistic regression, glmnet, random forest, and XGBoost.
+###############################################################################
+
+###############################################################################
+# 1. LOAD LIBRARIES
+###############################################################################
+
+# tidyverse = data wrangling
+# tidymodels = modeling framework
+# skimr = optional quick data summary
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(vip)
+library(ranger)
+library(xgboost)
+
+###############################################################################
+# 2. SET GLOBAL OPTIONS / SEED
+###############################################################################
+
+# Why:
+# A fixed seed ensures reproducibility.
+# This means your train/test split and resamples will be the same each time.
+set.seed(123)
+
+###############################################################################
+# 3. LOAD THE FINISHED RRH DATASET
+###############################################################################
+
+# Why:
+# We are reading in the clean one-row-per-client dataset that you already built.
+rrh_dataset <- read_csv("rrh_recidivism_modeling_dataset.csv", show_col_types = FALSE)
+
+###############################################################################
+# 4. QUICK INSPECTION OF THE INPUT DATA
+###############################################################################
+
+# Why:
+# Always inspect what was loaded before modeling.
+# This helps catch file/path issues and confirms the data shape.
+glimpse(rrh_dataset)
+
+# Confirm row count and unique client count
+rrh_dataset %>%
+  summarise(
+    rows = n(),
+    unique_clients = n_distinct(clients_unique_identifier)
+  ) %>%
+  print()
+
+# Confirm target balance
+rrh_dataset %>%
+  count(target_recidivated) %>%
+  print()
+
+
+
+###############################################################################
+# 4B. RESTRICT TO SERVICE-ELIGIBLE CLIENTS
+#
+# PURPOSE:
+# We only want to model clients we could realistically serve.
+#
+# ELIGIBLE DESTINATIONS:
+# 410 = Rental by client, with ongoing housing subsidy
+# 411 = Rental by client, no ongoing housing subsidy
+# 421 = Owned by client, with ongoing housing subsidy
+# 435 = Owned by client, no ongoing housing subsidy
+#
+# IMPORTANT 435 EXCEPTION:
+# If destination_code == 435, exclude the client when rental_subsidy_type is:
+# - "RRH or equivalent subsidy"
+# - "Permanent Supportive Housing"
+###############################################################################
+
+eligible_destination_codes <- c(410, 411, 421, 435)
+
+excluded_435_subsidy_types <- c(
+  "RRH or equivalent subsidy",
+  "Permanent Supportive Housing"
+)
+
+rrh_dataset_eligible <- rrh_dataset %>%
+  mutate(
+    destination_code = suppressWarnings(as.numeric(destination_code)),
+    rental_subsidy_type = as.character(rental_subsidy_type),
+    
+    service_eligible = case_when(
+      destination_code %in% c(410, 411, 421) ~ 1L,
+      destination_code == 435 &
+        !rental_subsidy_type %in% excluded_435_subsidy_types ~ 1L,
+      TRUE ~ 0L
+    )
+  ) %>%
+  filter(service_eligible == 1L)
+
+# QA: how many clients remain after service-eligibility restriction?
+rrh_dataset %>%
+  summarise(
+    rows_before = n(),
+    clients_before = n_distinct(clients_unique_identifier)
+  ) %>%
+  print()
+
+rrh_dataset_eligible %>%
+  summarise(
+    rows_after = n(),
+    clients_after = n_distinct(clients_unique_identifier)
+  ) %>%
+  print()
+
+# QA: check remaining destination/subsidy combinations
+rrh_dataset_eligible %>%
+  count(destination_code, rental_subsidy_type, sort = TRUE) %>%
+  print(n = 50)
+
+
+
+###############################################################################
+# 5. CREATE MODELING VERSION OF THE DATA
+###############################################################################
+
+# Why:
+# The raw RRH dataset contains fields that are useful for auditing and review
+# but should NOT be used as predictors in a model.
+#
+# For example:
+# - clients_unique_identifier = ID only, not a real signal
+# - baseline_enrollment_id = ID only
+# - baseline_program_name = overly specific text, likely to overfit
+# - baseline dates = not impossible to use, but we are intentionally removing
+#   them for now to keep the first model cleaner and simpler
+#
+# We also need to:
+# - convert the target into a factor for classification
+# - convert categorical predictors to factors
+# - keep numeric predictors numeric
+###############################################################################
+
+rrh_model_data <- rrh_dataset_eligible %>%
+  mutate(
+    ###########################################################################
+    # TARGET
+    ###########################################################################
+    target_recidivated = factor(
+      if_else(target_recidivated == 1, "Yes", "No"),
+      levels = c("No", "Yes")
+    ),
+    
+    ###########################################################################
+    # SIMPLE ENGINEERED FEATURES
+    #
+    # Why:
+    # These may help the model detect meaningful risk structure more easily.
+    ###########################################################################
+    any_prior_recidivism = factor(if_else(prior_recidivism_count > 0, 1, 0)),
+    chronic_homeless_history_flag = factor(if_else(count_of_homeless_months >= 12, 1, 0)),
+    
+    ###########################################################################
+    # CATEGORICAL PREDICTORS
+    ###########################################################################
+    aftercare = factor(aftercare),
+    mental_health = factor(mental_health),
+    substance_use = factor(substance_use),
+    disabling_condition = factor(disabling_condition),
+    race = factor(race),
+    gender = factor(gender),
+    veteran = factor(veteran),
+    high_enrollment_flag = factor(high_enrollment_flag),
+    rental_subsidy_type = factor(rental_subsidy_type)
+  ) %>%
+  select(
+    -clients_unique_identifier,
+    -baseline_enrollment_id,
+    -baseline_program_name,
+    -baseline_project_type,
+    -baseline_start_date,
+    -baseline_exit_date,
+    -client_full_name,
+    -service_eligible,
+    
+    ###########################################################################
+    # REMOVE DUPLICATIVE / LESS USEFUL FIELDS
+    #
+    # Keep destination_code and drop destination text version
+    ###########################################################################
+    -destination
+  )
+
+###############################################################################
+# 6. INSPECT THE FINAL MODELING TABLE
+###############################################################################
+
+# Why:
+# Confirm the structure after conversions.
+glimpse(rrh_model_data)
+
+# Optional: skim summary
+skim(rrh_model_data)
+
+# Confirm target is now a factor with correct level order
+levels(rrh_model_data$target_recidivated)
+
+# Confirm class balance after transformation
+rrh_model_data %>%
+  count(target_recidivated) %>%
+  mutate(pct = n / sum(n)) %>%
+  print()
+
+###############################################################################
+# 7. TRAIN / TEST SPLIT
+###############################################################################
+
+# Why:
+# We need a holdout test set for final evaluation.
+# The model should not train on the test data.
+#
+# Why stratify?
+# Because the recidivism class is the minority class.
+# Stratification preserves the class balance in train and test.
+rrh_split <- initial_split(
+  rrh_model_data,
+  prop = 0.80,
+  strata = target_recidivated
+)
+
+# Extract train and test sets
+rrh_train <- training(rrh_split)
+rrh_test  <- testing(rrh_split)
+
+# Check class balance in each split
+rrh_train %>%
+  count(target_recidivated) %>%
+  mutate(pct = n / sum(n)) %>%
+  print()
+
+rrh_test %>%
+  count(target_recidivated) %>%
+  mutate(pct = n / sum(n)) %>%
+  print()
+
+
+###############################################################################
+# 7B. CLASS IMBALANCE HELPER
+#
+# Why:
+# XGBoost can use class weighting to pay more attention to the minority class.
+###############################################################################
+
+n_no  <- sum(rrh_train$target_recidivated == "No")
+n_yes <- sum(rrh_train$target_recidivated == "Yes")
+
+scale_pos_weight_value <- n_no / n_yes
+
+cat("XGBoost scale_pos_weight:", scale_pos_weight_value, "\n")
+
+###############################################################################
+# 8. CROSS-VALIDATION FOLDS
+###############################################################################
+
+# Why:
+# During tuning, we do not want to rely only on one split of the training data.
+# v-fold CV gives a more stable estimate of model performance.
+#
+# Again, we stratify on the target.
+rrh_folds <- vfold_cv(
+  rrh_train,
+  v = 10,
+  strata = target_recidivated
+)
+
+###############################################################################
+# 9. DEFINE MODELING METRICS
+###############################################################################
+
+# Why:
+# Because this is an imbalanced binary classification problem, we should not rely
+# only on accuracy.
+#
+# We care about:
+# - roc_auc   = ranking ability
+# - accuracy  = overall correctness
+# - sens      = sensitivity / recall for event class
+# - spec      = specificity
+# - kap       = agreement beyond chance
+# - precision = how often positive predictions are correct
+# - recall    = same basic idea as sensitivity
+my_metrics <- metric_set(
+  roc_auc,
+  accuracy,
+  sens,
+  yardstick::spec,
+  kap,
+  precision,
+  recall
+)
+
+
+###############################################################################
+# 10. PREPROCESSING BLUEPRINTS
+###############################################################################
+
+# Why two recipes?
+#
+# Some models need more preprocessing than others.
+#
+# Logistic / glmnet:
+# - benefits from scaling
+# - can benefit from transformation of skewed numeric predictors
+# - needs dummy variables for factors
+#
+# Tree models:
+# - do NOT need scaling
+# - do NOT need normalization
+# - still need missing value handling
+# - may still need dummy variables depending on engine / workflow setup
+#
+# IMPORTANT NOTE:
+# We are leaving numeric missingness in the data intentionally so the recipe
+# handles it INSIDE resampling and avoids leakage.
+###############################################################################
+
+###############################################################################
+# 10A. LOGISTIC / GLMNET RECIPE
+###############################################################################
+rrh_recipe_log <- recipe(target_recidivated ~ ., data = rrh_train) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_corr(all_numeric_predictors()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE)
+
+###############################################################################
+# 10B. TREE-BASED MODEL RECIPE
+###############################################################################
+
+rrh_recipe_tree <- recipe(target_recidivated ~ ., data = rrh_train) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_corr(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE)
+
+###############################################################################
+# 11. OPTIONAL: PREP AND INSPECT RECIPES
+###############################################################################
+
+# Why:
+# This is helpful for debugging before fitting any models.
+log_prep <- prep(rrh_recipe_log)
+tree_prep <- prep(rrh_recipe_tree)
+
+# See processed training columns
+juice(log_prep) %>% glimpse()
+juice(tree_prep) %>% glimpse()
+
+###############################################################################
+# 12. OPTIONAL: CHECK PREDICTOR COUNTS AFTER PREPROCESSING
+###############################################################################
+
+# Why:
+# This is especially useful for tuning mtry in RF/XGBoost later.
+p_tree <- juice(tree_prep) %>% ncol() - 1
+p_log  <- juice(log_prep) %>% ncol() - 1
+
+cat("Number of predictors after tree preprocessing:", p_tree, "\n")
+cat("Number of predictors after log preprocessing:", p_log, "\n")
+
+###############################################################################
+# 13. SAVE OPTIONAL MODELING OBJECTS
+#
+# Why:
+# Optional convenience. Lets you reload the split/folds/recipes later without
+# recreating everything.
+###############################################################################
+
+saveRDS(rrh_split, "rrh_split.rds")
+saveRDS(rrh_folds, "rrh_folds.rds")
+saveRDS(rrh_recipe_log, "rrh_recipe_log.rds")
+saveRDS(rrh_recipe_tree, "rrh_recipe_tree.rds")
+
+###############################################################################
+# 14. NEXT STEPS
+#
+# After this script runs successfully, you are ready to add:
+#
+# - logistic_reg() with glm
+# - logistic_reg(penalty = tune(), mixture = 1) with glmnet
+# - rand_forest() with ranger
+# - boost_tree() with xgboost
+#
+# Then:
+# - workflows
+# - tuning
+# - resample comparison
+# - final last_fit() test evaluation
+###############################################################################
+
+
+###############################################################################
+# 15. DEFINE MODELS
+###############################################################################
+
+###############################################################################
+# 15A. STANDARD LOGISTIC REGRESSION (GLM)
+#
+# Why:
+# Baseline interpretable model.
+# No tuning parameters here.
+###############################################################################
+
+log_reg_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+###############################################################################
+# 15B. PENALIZED LOGISTIC REGRESSION (GLMNET)
+#
+# Why:
+# Handles many predictors well and can shrink noisy coefficients.
+#
+# penalty = lambda
+# mixture = 1 means LASSO
+###############################################################################
+
+glmnet_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = 1
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+###############################################################################
+# 15C. RANDOM FOREST (RANGER)
+#
+# Why:
+# Strong non-linear baseline for tabular data.
+#
+# mtry  = number of predictors sampled at each split
+# min_n = minimum observations in a terminal node
+# trees = fixed large number for stability
+###############################################################################
+
+rf_spec <- rand_forest(
+  mtry = tune(),
+  min_n = tune(),
+  trees = 1000
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+
+
+###############################################################################
+# 15D. XGBOOST
+#
+# Why:
+# Powerful boosted-tree model for tabular prediction.
+# scale_pos_weight helps address class imbalance.
+###############################################################################
+
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune()
+) %>%
+  set_engine(
+    "xgboost",
+    scale_pos_weight = scale_pos_weight_value
+  ) %>%
+  set_mode("classification")
+
+
+
+###############################################################################
+# 16. BUILD WORKFLOWS
+###############################################################################
+
+log_wf <- workflow() %>%
+  add_model(log_reg_spec) %>%
+  add_recipe(rrh_recipe_log)
+
+glmnet_wf <- workflow() %>%
+  add_model(glmnet_spec) %>%
+  add_recipe(rrh_recipe_log)
+
+rf_wf <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(rrh_recipe_tree)
+
+xgb_wf <- workflow() %>%
+  add_model(xgb_spec) %>%
+  add_recipe(rrh_recipe_tree)
+
+###############################################################################
+# 17. FIT UNTUNED LOGISTIC REGRESSION
+#
+# Why:
+# Gives us a simple baseline before tuning more complex models.
+###############################################################################
+
+log_res <- fit_resamples(
+  log_wf,
+  resamples = rrh_folds,
+  metrics = my_metrics,
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(log_res)
+
+###############################################################################
+# 18. DEFINE TUNING GRIDS
+###############################################################################
+
+###############################################################################
+# 18A. GLMNET GRID
+###############################################################################
+
+glmnet_grid <- grid_regular(
+  penalty(range = c(-4, 1)),
+  levels = 30
+)
+
+###############################################################################
+# 18B. RANDOM FOREST GRID
+###############################################################################
+
+rf_grid <- grid_regular(
+  mtry(range = c(1L, min(50L, p_tree))),
+  min_n(range = c(2L, 25L)),
+  levels = 5
+)
+
+###############################################################################
+# 18C. XGBOOST GRID
+#
+# finalize() is important for mtry because the upper limit depends on p_tree.
+###############################################################################
+
+xgb_params <- hardhat::extract_parameter_set_dials(xgb_spec) %>%
+  update(
+    mtry = mtry(range = c(1L, min(50L, p_tree))),
+    tree_depth = tree_depth(range = c(2L, 10L)),
+    min_n = min_n(range = c(2L, 20L)),
+    learn_rate = learn_rate(range = c(-4, -1)),
+    loss_reduction = loss_reduction(range = c(-3, 1)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+xgb_grid <- grid_space_filling(
+  xgb_params,
+  size = 30
+)
+
+###############################################################################
+# 19. TUNE MODELS
+###############################################################################
+
+###############################################################################
+# 19A. TUNE GLMNET
+###############################################################################
+
+glmnet_res <- tune_grid(
+  glmnet_wf,
+  resamples = rrh_folds,
+  grid = glmnet_grid,
+  metrics = my_metrics,
+  control = control_grid(save_pred = TRUE)
+)
+
+collect_metrics(glmnet_res)
+
+###############################################################################
+# 19B. TUNE RANDOM FOREST
+###############################################################################
+
+rf_res <- tune_grid(
+  rf_wf,
+  resamples = rrh_folds,
+  grid = rf_grid,
+  metrics = my_metrics,
+  control = control_grid(save_pred = TRUE)
+)
+
+collect_metrics(rf_res)
+
+###############################################################################
+# 19C. TUNE XGBOOST
+###############################################################################
+
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = rrh_folds,
+  grid = xgb_grid,
+  metrics = my_metrics,
+  control = control_grid(save_pred = TRUE)
+)
+
+collect_metrics(xgb_res)
+
+###############################################################################
+# 20. COMPARE MODELS ACROSS RESAMPLES
+#
+# Why:
+# Put model performance into one table for comparison.
+###############################################################################
+
+log_metrics <- collect_metrics(log_res) %>%
+  mutate(model = "Logistic GLM")
+
+glmnet_metrics <- collect_metrics(glmnet_res) %>%
+  mutate(model = "GLMNET")
+
+rf_metrics <- collect_metrics(rf_res) %>%
+  mutate(model = "Random Forest")
+
+xgb_metrics <- collect_metrics(xgb_res) %>%
+  mutate(model = "XGBoost")
+
+all_model_metrics <- bind_rows(
+  log_metrics,
+  glmnet_metrics,
+  rf_metrics,
+  xgb_metrics
+)
+
+# View all metrics
+all_model_metrics %>%
+  arrange(.metric, desc(mean)) %>%
+  print(n = 100)
+
+# Focus on ROC AUC
+all_model_metrics %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean)) %>%
+  print()
+
+###############################################################################
+# 21. SELECT BEST TUNED VERSION OF EACH MODEL
+#
+# We will use ROC AUC as the main selection metric.
+###############################################################################
+
+best_glmnet <- select_best(glmnet_res, metric = "roc_auc")
+best_rf     <- select_best(rf_res, metric = "roc_auc")
+best_xgb    <- select_best(xgb_res, metric = "roc_auc")
+
+best_glmnet
+best_rf
+best_xgb
+
+###############################################################################
+# 22. FINALIZE WORKFLOWS
+###############################################################################
+
+final_glmnet_wf <- finalize_workflow(glmnet_wf, best_glmnet)
+final_rf_wf     <- finalize_workflow(rf_wf, best_rf)
+final_xgb_wf    <- finalize_workflow(xgb_wf, best_xgb)
+
+###############################################################################
+# 23. CHOOSE FINAL MODEL
+#
+# SIMPLE APPROACH:
+# Choose the model with the best ROC AUC from resampling.
+#
+# You can also manually override this if another model has better sensitivity
+# or business usefulness.
+###############################################################################
+
+model_rank_tbl <- bind_rows(
+  collect_metrics(log_res) %>%
+    filter(.metric == "roc_auc") %>%
+    mutate(model = "Logistic GLM"),
+  collect_metrics(glmnet_res) %>%
+    filter(.metric == "roc_auc") %>%
+    slice_max(order_by = mean, n = 1, with_ties = FALSE) %>%
+    mutate(model = "GLMNET"),
+  collect_metrics(rf_res) %>%
+    filter(.metric == "roc_auc") %>%
+    slice_max(order_by = mean, n = 1, with_ties = FALSE) %>%
+    mutate(model = "Random Forest"),
+  collect_metrics(xgb_res) %>%
+    filter(.metric == "roc_auc") %>%
+    slice_max(order_by = mean, n = 1, with_ties = FALSE) %>%
+    mutate(model = "XGBoost")
+) %>%
+  arrange(desc(mean))
+
+print(model_rank_tbl)
+
+best_model_name <- model_rank_tbl$model[1]
+cat("Best model based on ROC AUC:", best_model_name, "\n")
+
+###############################################################################
+# 24. LAST_FIT ON THE TEST SET
+#
+# We now evaluate the selected final model one time on the untouched test set.
+###############################################################################
+
+if (best_model_name == "Logistic GLM") {
+  final_fit <- last_fit(
+    log_wf,
+    split = rrh_split,
+    metrics = my_metrics
+  )
+}
+
+if (best_model_name == "GLMNET") {
+  final_fit <- last_fit(
+    final_glmnet_wf,
+    split = rrh_split,
+    metrics = my_metrics
+  )
+}
+
+if (best_model_name == "Random Forest") {
+  final_fit <- last_fit(
+    final_rf_wf,
+    split = rrh_split,
+    metrics = my_metrics
+  )
+}
+
+if (best_model_name == "XGBoost") {
+  final_fit <- last_fit(
+    final_xgb_wf,
+    split = rrh_split,
+    metrics = my_metrics
+  )
+}
+
+
+###############################################################################
+# 25. FINAL TEST RESULTS
+###############################################################################
+
+final_metrics <- collect_metrics(final_fit)
+print(final_metrics)
+
+final_predictions <- collect_predictions(final_fit)
+print(head(final_predictions))
+
+###############################################################################
+# 26. DEFAULT CONFUSION MATRIX AT 0.50 THRESHOLD
+###############################################################################
+
+cat("\nDefault 0.50 threshold confusion matrix:\n")
+
+final_predictions %>%
+  conf_mat(truth = target_recidivated, estimate = .pred_class) %>%
+  print()
+
+###############################################################################
+# 27. CHOOSE THRESHOLD USING CROSS-VALIDATION PREDICTIONS
+#
+# IMPORTANT:
+# We do NOT use the test set to choose the threshold.
+# We use cross-validation predictions from the best training model.
+###############################################################################
+
+thresholds_to_try <- c(0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50)
+
+###############################################################################
+# 27A. GET CV PREDICTIONS FROM THE BEST MODEL
+###############################################################################
+
+if (best_model_name == "Logistic GLM") {
+  cv_predictions <- collect_predictions(log_res)
+}
+
+if (best_model_name == "GLMNET") {
+  cv_predictions <- collect_predictions(glmnet_res) %>%
+    filter(.config == best_glmnet$.config[[1]])
+}
+
+if (best_model_name == "Random Forest") {
+  cv_predictions <- collect_predictions(rf_res) %>%
+    filter(.config == best_rf$.config[[1]])
+}
+
+if (best_model_name == "XGBoost") {
+  cv_predictions <- collect_predictions(xgb_res) %>%
+    filter(.config == best_xgb$.config[[1]])
+}
+
+###############################################################################
+# 27B. EVALUATE THRESHOLDS ON CV PREDICTIONS
+###############################################################################
+
+threshold_results_cv <- map_dfr(thresholds_to_try, function(thresh) {
+  
+  preds_thresh <- cv_predictions %>%
+    mutate(
+      pred_class_custom = factor(
+        if_else(.pred_Yes >= thresh, "Yes", "No"),
+        levels = c("No", "Yes")
+      )
+    )
+  
+  tibble(
+    threshold = thresh,
+    accuracy = accuracy(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom
+    )$.estimate,
+    
+    recall_yes = sens(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom,
+      event_level = "second"
+    )$.estimate,
+    
+    specificity_no = yardstick::spec(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom,
+      event_level = "second"
+    )$.estimate,
+    
+    precision_yes = precision(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom,
+      event_level = "second"
+    )$.estimate,
+    
+    kap = kap(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom
+    )$.estimate
+  )
+})
+
+print(threshold_results_cv)
+
+###############################################################################
+# 27C. CHOOSE THRESHOLD FROM CV RESULTS
+#
+# For now, choose threshold with highest Kappa.
+# You can later change this to prioritize recall or precision.
+###############################################################################
+
+best_threshold_row <- threshold_results_cv %>%
+  slice_max(order_by = kap, n = 1, with_ties = FALSE)
+
+print(best_threshold_row)
+
+best_threshold <- best_threshold_row$threshold[[1]]
+
+cat("\nChosen threshold from CV predictions:", best_threshold, "\n")
+
+###############################################################################
+# 27D. APPLY CHOSEN THRESHOLD TO TEST SET
+###############################################################################
+
+final_predictions_best_thresh <- final_predictions %>%
+  mutate(
+    pred_class_custom = factor(
+      if_else(.pred_Yes >= best_threshold, "Yes", "No"),
+      levels = c("No", "Yes")
+    )
+  )
+
+cat("\nConfusion matrix on TEST SET at chosen threshold:\n")
+
+final_predictions_best_thresh %>%
+  conf_mat(truth = target_recidivated, estimate = pred_class_custom) %>%
+  print()
+
+cat("\nMetrics on TEST SET at chosen threshold:\n")
+
+test_threshold_metrics <- tibble(
+  accuracy = accuracy(
+    final_predictions_best_thresh,
+    truth = target_recidivated,
+    estimate = pred_class_custom
+  )$.estimate,
+  
+  recall_yes = sens(
+    final_predictions_best_thresh,
+    truth = target_recidivated,
+    estimate = pred_class_custom,
+    event_level = "second"
+  )$.estimate,
+  
+  specificity_no = yardstick::spec(
+    final_predictions_best_thresh,
+    truth = target_recidivated,
+    estimate = pred_class_custom,
+    event_level = "second"
+  )$.estimate,
+  
+  precision_yes = precision(
+    final_predictions_best_thresh,
+    truth = target_recidivated,
+    estimate = pred_class_custom,
+    event_level = "second"
+  )$.estimate,
+  
+  kap = kap(
+    final_predictions_best_thresh,
+    truth = target_recidivated,
+    estimate = pred_class_custom
+  )$.estimate
+)
+
+print(test_threshold_metrics)
+
+###############################################################################
+# 27E. ROC CURVE
+###############################################################################
+
+final_predictions %>%
+  roc_curve(truth = target_recidivated, .pred_Yes) %>%
+  autoplot()
+
+###############################################################################
+# 28. OPTIONAL: VARIABLE IMPORTANCE
+#
+# For tree models, fit the finalized workflow on the full training set first.
+###############################################################################
+
+if (best_model_name == "Random Forest") {
+  final_rf_fit_train <- fit(final_rf_wf, data = rrh_train)
+  
+  rf_engine <- extract_fit_parsnip(final_rf_fit_train)$fit
+  vip::vip(rf_engine)
+  
+  ranger::importance(rf_engine)
+}
+
+if (best_model_name == "XGBoost") {
+  final_xgb_fit_train <- fit(final_xgb_wf, data = rrh_train)
+  
+  xgb_engine <- extract_fit_parsnip(final_xgb_fit_train)$fit
+  vip::vip(xgb_engine)
+}
+
+
+###############################################################################
+# 29. SAVE RESULTS
+###############################################################################
+
+saveRDS(log_res, "log_res.rds")
+saveRDS(glmnet_res, "glmnet_res.rds")
+saveRDS(rf_res, "rf_res.rds")
+saveRDS(xgb_res, "xgb_res.rds")
+saveRDS(final_fit, "final_fit.rds")
+
+write_csv(final_metrics, "final_model_test_metrics_default_threshold.csv")
+write_csv(final_predictions, "final_model_test_predictions.csv")
+write_csv(threshold_results_cv, "cv_threshold_comparison.csv")
+write_csv(test_threshold_metrics, "final_model_test_metrics_best_threshold.csv")
+write_csv(final_predictions_best_thresh, "final_model_test_predictions_best_threshold.csv")
+
