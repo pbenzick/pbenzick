@@ -1,0 +1,857 @@
+###############################################################################
+# RRH RECIDIVISM DATASET BUILDER
+#
+# PURPOSE:
+# Build a one-row-per-client RRH dataset for future predictive modeling.
+#
+# BASELINE RULE:
+# Latest RRH exit within the user-defined exit-date window per client.
+#
+# HISTORY RULE:
+# All prior-history variables use enrollments strictly before the baseline
+# RRH start date.
+#
+# TARGET RULE:
+# Join a separate recidivism file by Clients Unique Identifier.
+#
+# EVICTION RULE:
+# Match RRH clients to eviction cases using normalized exact full-name matching:
+#   RRH:      Clients Client Full Name
+#   Eviction: DEFENDANT_NAME
+#
+# Count only eviction cases where:
+#   CASE_INITIATION_DATE < baseline_start_date
+#
+# Count DISTINCT CASE_NUM_MINOR to avoid overcounting duplicate case rows.
+#
+# CLEANING APPROACH:
+# - Keep numeric fields numeric
+# - Standardize categorical "unknown-like" values to "Unknown"
+# - Do NOT force unknown disability/mental health/substance use to "No"
+#
+# IMPORTANT REVISIONS:
+# - Removed the prior 999 sentinel approach for recency variables
+# - Added binary flags for whether a prior event exists
+# - Kept recency variables as real month counts with NA if no prior event exists
+###############################################################################
+
+###############################################################################
+# 1. LOAD LIBRARIES
+###############################################################################
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(stringr)
+library(tidyr)
+
+###############################################################################
+# 2. USER SETTINGS
+###############################################################################
+
+# Baseline RRH exit window
+baseline_start <- as.Date("2023-01-01")
+baseline_end   <- as.Date("2023-12-31")
+
+# Input files
+main_file      <- "01_Predictive_RRH_Recidivism 2023 Group.csv"
+recid_file     <- "02_Of total clients Cal 2023 - This is who recidivated 2023.csv"
+evictions_file <- "03_evictions_hsc.csv"   # <-- change if your actual file name differs
+
+###############################################################################
+# 3. LOAD DATA
+###############################################################################
+
+df_raw        <- read_csv(main_file, show_col_types = FALSE)
+recid_raw     <- read_csv(recid_file, show_col_types = FALSE)
+evictions_raw <- read_csv(evictions_file, show_col_types = FALSE)
+
+###############################################################################
+# 4. CLEAN COLUMN NAMES
+###############################################################################
+
+df <- df_raw %>%
+  clean_names()
+
+recid <- recid_raw %>%
+  clean_names()
+
+evictions <- evictions_raw %>%
+  clean_names()
+
+###############################################################################
+# 5. PARSE DATES
+#
+# PURPOSE:
+# Handle date columns safely whether they arrive as:
+# - Date
+# - character
+# - blank
+###############################################################################
+
+parse_date_safe <- function(x) {
+  # If already Date, keep it
+  if (inherits(x, "Date")) {
+    return(x)
+  }
+  
+  # Otherwise convert to character and parse
+  x_chr <- as.character(x)
+  x_chr[x_chr == ""] <- NA_character_
+  
+  suppressWarnings(as.Date(parse_date_time(
+    x_chr,
+    orders = c("mdy", "ymd", "m/d/Y", "Y-m-d")
+  )))
+}
+
+df <- df %>%
+  mutate(
+    enrollments_project_start_date = parse_date_safe(enrollments_project_start_date),
+    enrollments_project_exit_date  = parse_date_safe(enrollments_project_exit_date)
+  )
+
+evictions <- evictions %>%
+  mutate(
+    case_initiation_date = parse_date_safe(case_initiation_date)
+  )
+
+###############################################################################
+# 5B. FIX ENCODING ISSUES IN PROGRAM TYPE TEXT
+#
+# PURPOSE:
+# Replace bad encoding such as "â€“" with a standard hyphen "-"
+###############################################################################
+
+df <- df %>%
+  mutate(
+    programs_project_type_code = programs_project_type_code %>%
+      str_replace_all("â€“", "-") %>%
+      str_replace_all("–", "-") %>%
+      str_squish()
+  )
+
+###############################################################################
+# 6. BUILD TARGET FILE
+#
+# If a client appears in the recidivism file, target_recidivated = 1
+#
+# IMPORTANT:
+# This file should represent the 24-month recidivism rule.
+###############################################################################
+
+recid_target <- recid %>%
+  distinct(clients_unique_identifier) %>%
+  mutate(target_recidivated = 1L)
+
+###############################################################################
+# 7. DEFINE PROJECT TYPE GROUPS
+###############################################################################
+
+rrh_code <- "PH - Rapid Re-Housing"
+
+psh_rrh_codes <- c(
+  "PH - Permanent Supportive Housing (disability required for entry)",
+  "PH - Rapid Re-Housing"
+)
+
+cat1_codes <- c(
+  "Emergency Shelter - Night-by-Night",
+  "Emergency Shelter - Entry Exit",
+  "Safe Haven",
+  "Street Outreach"
+)
+
+###############################################################################
+# 8. HELPER FUNCTIONS
+###############################################################################
+
+# Count calendar months touched by an enrollment
+count_months_touched <- function(start_date, end_date) {
+  ifelse(
+    is.na(start_date) | is.na(end_date) | end_date < start_date,
+    0L,
+    (year(end_date) - year(start_date)) * 12 +
+      (month(end_date) - month(start_date)) + 1L
+  )
+}
+
+# Expand an enrollment to all calendar months touched
+expand_to_months <- function(start_date, end_date) {
+  if (is.na(start_date) | is.na(end_date) | end_date < start_date) {
+    return(as.Date(character()))
+  }
+  
+  start_month <- floor_date(start_date, unit = "month")
+  end_month   <- floor_date(end_date, unit = "month")
+  
+  seq.Date(from = start_month, to = end_month, by = "month")
+}
+
+# Standardize "unknown-like" categorical values
+standardize_unknown <- function(x) {
+  case_when(
+    is.na(x) ~ "Unknown",
+    x %in% c(
+      "Data not collected",
+      "Client doesn't know",
+      "Client prefers not to answer"
+    ) ~ "Unknown",
+    TRUE ~ as.character(x)
+  )
+}
+
+# Normalize names for conservative exact matching
+normalize_name <- function(x) {
+  x %>%
+    coalesce("") %>%
+    str_to_upper() %>%
+    str_replace_all("[^A-Z0-9 ]", " ") %>%
+    str_squish()
+}
+
+# Count full months between two dates
+months_between_dates <- function(earlier_date, later_date) {
+  ifelse(
+    is.na(earlier_date) | is.na(later_date) | earlier_date > later_date,
+    NA_real_,
+    floor(time_length(interval(earlier_date, later_date), "month"))
+  )
+}
+
+###############################################################################
+# 9. IDENTIFY BASELINE RRH ENROLLMENT
+#
+# BASELINE:
+# Latest RRH exit in the specified date window per client
+#
+# FINAL GRAIN:
+# One row per client
+###############################################################################
+
+baseline_rrh <- df %>%
+  filter(
+    programs_project_type_code == rrh_code,
+    !is.na(enrollments_project_exit_date),
+    enrollments_project_exit_date >= baseline_start,
+    enrollments_project_exit_date <= baseline_end
+  ) %>%
+  arrange(
+    clients_unique_identifier,
+    desc(enrollments_project_exit_date),
+    desc(enrollments_enrollment_id)
+  ) %>%
+  group_by(clients_unique_identifier) %>%
+  dplyr::slice_head(n = 1) %>%
+  ungroup() %>%
+  transmute(
+    clients_unique_identifier,
+    baseline_enrollment_id = enrollments_enrollment_id,
+    baseline_program_name = programs_name,
+    baseline_project_type = programs_project_type_code,
+    baseline_start_date = enrollments_project_start_date,
+    baseline_exit_date = enrollments_project_exit_date,
+    
+    # Full name is retained here only for eviction matching and QA
+    client_full_name = clients_client_full_name,
+    client_full_name_norm = normalize_name(clients_client_full_name),
+    
+    # Direct baseline variables pulled from the baseline RRH row
+    income_change_any = any_income_change,
+    earned_income_change = earned_income_change,
+    income_at_exit_earned = update_exit_screen_earned_income_amount,
+    income_at_exit_any = update_exit_screen_income_amount_other,
+    num_children = enrollments_count_children,
+    mental_health = update_exit_screen_mental_health,
+    substance_use = update_exit_screen_substance_use_disorder,
+    disabling_condition = update_exit_screen_disabling_condition,
+    age_at_exit = age_at_exit,
+    race = clients_race_and_ethnicity,
+    gender = clients_gender,
+    veteran = clients_veteran_status,
+    
+    # Baseline exit fields
+    destination = update_exit_screen_destination,
+    destination_code = update_exit_screen_destination_code,
+    rental_subsidy_type = update_exit_screen_rental_subsidy_type
+  )
+
+###############################################################################
+# 9B. AFTERCARE FLAG
+#
+# aftercare = 1 if the client has an enrollment beginning within 180 days after
+# the baseline RRH exit and the Programs Name contains "aftercare"
+###############################################################################
+
+aftercare_flag <- df %>%
+  inner_join(
+    baseline_rrh %>%
+      select(clients_unique_identifier, baseline_exit_date),
+    by = "clients_unique_identifier"
+  ) %>%
+  filter(
+    !is.na(enrollments_project_start_date),
+    enrollments_project_start_date > baseline_exit_date,
+    enrollments_project_start_date <= baseline_exit_date + 180,
+    str_detect(str_to_lower(coalesce(programs_name, "")), "aftercare")
+  ) %>%
+  distinct(clients_unique_identifier) %>%
+  mutate(aftercare = 1L)
+
+###############################################################################
+# 9C. EVICTION FEATURES
+###############################################################################
+
+evictions_clean <- evictions %>%
+  mutate(
+    defendant_name_norm = normalize_name(defendant_name)
+  ) %>%
+  filter(
+    !is.na(case_num_minor),
+    !is.na(case_initiation_date),
+    defendant_name_norm != ""
+  ) %>%
+  distinct(
+    case_num_minor,
+    case_initiation_date,
+    defendant_name_norm,
+    .keep_all = TRUE
+  )
+
+eviction_features <- baseline_rrh %>%
+  select(
+    clients_unique_identifier,
+    baseline_start_date,
+    client_full_name,
+    client_full_name_norm
+  ) %>%
+  filter(client_full_name_norm != "") %>%
+  inner_join(
+    evictions_clean,
+    by = c("client_full_name_norm" = "defendant_name_norm")
+  ) %>%
+  filter(case_initiation_date < baseline_start_date) %>%
+  group_by(clients_unique_identifier) %>%
+  summarise(
+    num_evictions_prior_to_baseline = n_distinct(case_num_minor),
+    eviction_name_match_flag = 1L,
+    .groups = "drop"
+  )
+
+###############################################################################
+# 10. BUILD PRE-BASELINE HISTORY
+#
+# Keep all non-baseline enrollments for that client with start date strictly
+# before the baseline RRH start date.
+#
+# If a prior enrollment has missing exit date, replace with baseline start date.
+###############################################################################
+
+history_prebaseline <- df %>%
+  inner_join(
+    baseline_rrh %>%
+      select(
+        clients_unique_identifier,
+        baseline_enrollment_id,
+        baseline_start_date,
+        baseline_exit_date
+      ),
+    by = "clients_unique_identifier"
+  ) %>%
+  filter(
+    enrollments_enrollment_id != baseline_enrollment_id,
+    enrollments_project_start_date < baseline_start_date
+  ) %>%
+  mutate(
+    hist_exit_date_filled = coalesce(enrollments_project_exit_date, baseline_start_date),
+    months_touched = count_months_touched(
+      enrollments_project_start_date,
+      hist_exit_date_filled
+    )
+  )
+
+###############################################################################
+# 11. DERIVED HISTORY FEATURES
+###############################################################################
+
+# 11A. number_prior_psh_rrh_enrollments
+prior_psh_rrh <- history_prebaseline %>%
+  filter(programs_project_type_code %in% psh_rrh_codes) %>%
+  group_by(clients_unique_identifier) %>%
+  summarise(
+    number_prior_psh_rrh_enrollments = n_distinct(enrollments_enrollment_id),
+    .groups = "drop"
+  )
+
+# 11B. long_term_cat1_count
+long_term_cat1 <- history_prebaseline %>%
+  filter(programs_project_type_code %in% cat1_codes) %>%
+  group_by(clients_unique_identifier) %>%
+  summarise(
+    long_term_cat1_count = n_distinct(enrollments_enrollment_id),
+    .groups = "drop"
+  )
+
+# 11C. high_enrollment_flag
+high_enrollment_flag <- long_term_cat1 %>%
+  transmute(
+    clients_unique_identifier,
+    high_enrollment_flag = if_else(long_term_cat1_count >= 20, 1L, 0L)
+  )
+
+# 11D. night_by_night
+night_by_night <- history_prebaseline %>%
+  filter(programs_project_type_code == "Emergency Shelter - Night-by-Night") %>%
+  group_by(clients_unique_identifier) %>%
+  summarise(
+    night_by_night = n_distinct(enrollments_enrollment_id),
+    .groups = "drop"
+  )
+
+# 11E. number_of_years_engaged_with_coc
+years_engaged <- history_prebaseline %>%
+  group_by(clients_unique_identifier) %>%
+  summarise(
+    first_project_start_date = min(enrollments_project_start_date, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  inner_join(
+    baseline_rrh %>%
+      select(clients_unique_identifier, baseline_exit_date),
+    by = "clients_unique_identifier"
+  ) %>%
+  mutate(
+    number_of_years_engaged_with_coc =
+      floor(time_length(interval(first_project_start_date, baseline_exit_date), "years"))
+  ) %>%
+  select(clients_unique_identifier, number_of_years_engaged_with_coc)
+
+# 11F. count_of_unsheltered_months
+unsheltered_months <- history_prebaseline %>%
+  filter(programs_project_type_code == "Street Outreach") %>%
+  rowwise() %>%
+  mutate(
+    month_list = list(expand_to_months(
+      enrollments_project_start_date,
+      hist_exit_date_filled
+    ))
+  ) %>%
+  ungroup() %>%
+  unnest(month_list) %>%
+  distinct(clients_unique_identifier, month_list) %>%
+  group_by(clients_unique_identifier) %>%
+  summarise(
+    count_of_unsheltered_months = n(),
+    .groups = "drop"
+  )
+
+# 11G. count_of_homeless_months
+homeless_months <- history_prebaseline %>%
+  filter(programs_project_type_code %in% cat1_codes) %>%
+  rowwise() %>%
+  mutate(
+    month_list = list(expand_to_months(
+      enrollments_project_start_date,
+      hist_exit_date_filled
+    ))
+  ) %>%
+  ungroup() %>%
+  unnest(month_list) %>%
+  distinct(clients_unique_identifier, month_list) %>%
+  group_by(clients_unique_identifier) %>%
+  summarise(
+    count_of_homeless_months = n(),
+    .groups = "drop"
+  )
+
+###############################################################################
+# 12. PRIOR RECIDIVISM COUNT
+#
+# Count 1 cycle when:
+#   PH/RRH exit  ->  category 1 start
+#
+# AND that category 1 start must occur:
+#   - after that PH/RRH exit
+#   - before the NEXT PH/RRH exit
+###############################################################################
+
+# All PH/RRH exits for the client up through baseline, including baseline itself
+all_ph_exits_for_windows <- df %>%
+  inner_join(
+    baseline_rrh %>%
+      select(
+        clients_unique_identifier,
+        baseline_enrollment_id,
+        baseline_start_date,
+        baseline_exit_date
+      ),
+    by = "clients_unique_identifier"
+  ) %>%
+  filter(
+    programs_project_type_code %in% psh_rrh_codes,
+    !is.na(enrollments_project_exit_date),
+    enrollments_project_exit_date <= baseline_exit_date
+  ) %>%
+  transmute(
+    clients_unique_identifier,
+    ph_enrollment_id = enrollments_enrollment_id,
+    ph_exit_date = enrollments_project_exit_date,
+    baseline_enrollment_id
+  ) %>%
+  distinct()
+
+# Build exit windows using the next PH/RRH exit
+ph_exit_windows <- all_ph_exits_for_windows %>%
+  arrange(clients_unique_identifier, ph_exit_date, ph_enrollment_id) %>%
+  group_by(clients_unique_identifier) %>%
+  mutate(
+    next_ph_exit_date = lead(ph_exit_date)
+  ) %>%
+  ungroup() %>%
+  filter(
+    ph_enrollment_id != baseline_enrollment_id
+  ) %>%
+  select(
+    clients_unique_identifier,
+    ph_enrollment_id,
+    ph_exit_date,
+    next_ph_exit_date
+  )
+
+# Category 1 starts before baseline start only
+prior_cat1_starts <- history_prebaseline %>%
+  filter(programs_project_type_code %in% cat1_codes) %>%
+  filter(!is.na(enrollments_project_start_date)) %>%
+  transmute(
+    clients_unique_identifier,
+    cat1_enrollment_id = enrollments_enrollment_id,
+    cat1_start_date = enrollments_project_start_date
+  ) %>%
+  distinct()
+
+# Count one cycle per PH/RRH exit window if any cat1 start falls in that window
+prior_recidivism_count <- ph_exit_windows %>%
+  left_join(
+    prior_cat1_starts,
+    by = "clients_unique_identifier",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    cat1_start_date > ph_exit_date,
+    is.na(next_ph_exit_date) | cat1_start_date < next_ph_exit_date
+  ) %>%
+  distinct(clients_unique_identifier, ph_enrollment_id) %>%
+  group_by(clients_unique_identifier) %>%
+  summarise(
+    prior_recidivism_count = n(),
+    .groups = "drop"
+  )
+
+###############################################################################
+# 12B. RECENCY FEATURES
+#
+# IMPORTANT REVISIONS:
+# - Added flags for whether a prior event exists
+# - Kept recency fields as actual month counts
+# - Left recency fields as NA when no prior event exists
+###############################################################################
+
+# 12B-1. Most recent prior category 1 enrollment start
+last_cat1_enrollment <- history_prebaseline %>%
+  filter(programs_project_type_code %in% cat1_codes) %>%
+  filter(!is.na(enrollments_project_start_date)) %>%
+  group_by(clients_unique_identifier) %>%
+  summarise(
+    last_cat1_start_date = max(enrollments_project_start_date, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  inner_join(
+    baseline_rrh %>%
+      select(clients_unique_identifier, baseline_start_date),
+    by = "clients_unique_identifier"
+  ) %>%
+  mutate(
+    has_prior_cat1_enrollment = 1L,
+    months_since_last_cat1_enrollment =
+      months_between_dates(last_cat1_start_date, baseline_start_date)
+  ) %>%
+  select(
+    clients_unique_identifier,
+    has_prior_cat1_enrollment,
+    months_since_last_cat1_enrollment
+  )
+
+# 12B-2. Most recent prior recidivism-triggering category 1 start
+prior_recidivism_events <- ph_exit_windows %>%
+  left_join(
+    prior_cat1_starts,
+    by = "clients_unique_identifier",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    cat1_start_date > ph_exit_date,
+    is.na(next_ph_exit_date) | cat1_start_date < next_ph_exit_date
+  ) %>%
+  group_by(clients_unique_identifier, ph_enrollment_id, ph_exit_date, next_ph_exit_date) %>%
+  summarise(
+    recidivism_event_date = min(cat1_start_date, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+last_prior_recidivism_event <- prior_recidivism_events %>%
+  group_by(clients_unique_identifier) %>%
+  summarise(
+    last_prior_recidivism_event_date = max(recidivism_event_date, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  inner_join(
+    baseline_rrh %>%
+      select(clients_unique_identifier, baseline_start_date),
+    by = "clients_unique_identifier"
+  ) %>%
+  mutate(
+    has_prior_recidivism_event = 1L,
+    months_since_last_prior_recidivism_event =
+      months_between_dates(last_prior_recidivism_event_date, baseline_start_date)
+  ) %>%
+  select(
+    clients_unique_identifier,
+    has_prior_recidivism_event,
+    months_since_last_prior_recidivism_event
+  )
+
+###############################################################################
+# 13. BUILD FINAL RRH DATASET
+###############################################################################
+
+rrh_dataset <- baseline_rrh %>%
+  left_join(prior_psh_rrh, by = "clients_unique_identifier") %>%
+  left_join(long_term_cat1, by = "clients_unique_identifier") %>%
+  left_join(high_enrollment_flag, by = "clients_unique_identifier") %>%
+  left_join(night_by_night, by = "clients_unique_identifier") %>%
+  left_join(years_engaged, by = "clients_unique_identifier") %>%
+  left_join(unsheltered_months, by = "clients_unique_identifier") %>%
+  left_join(homeless_months, by = "clients_unique_identifier") %>%
+  left_join(prior_recidivism_count, by = "clients_unique_identifier") %>%
+  left_join(last_cat1_enrollment, by = "clients_unique_identifier") %>%
+  left_join(last_prior_recidivism_event, by = "clients_unique_identifier") %>%
+  left_join(eviction_features, by = "clients_unique_identifier") %>%
+  left_join(recid_target, by = "clients_unique_identifier")
+
+rrh_dataset <- rrh_dataset %>%
+  left_join(aftercare_flag, by = "clients_unique_identifier") %>%
+  mutate(aftercare = coalesce(aftercare, 0L))
+
+# Defensively create any missing derived columns before coalesce
+if (!"number_prior_psh_rrh_enrollments" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(number_prior_psh_rrh_enrollments = NA_integer_)
+}
+if (!"long_term_cat1_count" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(long_term_cat1_count = NA_integer_)
+}
+if (!"high_enrollment_flag" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(high_enrollment_flag = NA_integer_)
+}
+if (!"night_by_night" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(night_by_night = NA_integer_)
+}
+if (!"number_of_years_engaged_with_coc" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(number_of_years_engaged_with_coc = NA_real_)
+}
+if (!"count_of_unsheltered_months" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(count_of_unsheltered_months = NA_integer_)
+}
+if (!"count_of_homeless_months" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(count_of_homeless_months = NA_integer_)
+}
+if (!"prior_recidivism_count" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(prior_recidivism_count = NA_integer_)
+}
+if (!"has_prior_cat1_enrollment" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(has_prior_cat1_enrollment = NA_integer_)
+}
+if (!"months_since_last_cat1_enrollment" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(months_since_last_cat1_enrollment = NA_real_)
+}
+if (!"has_prior_recidivism_event" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(has_prior_recidivism_event = NA_integer_)
+}
+if (!"months_since_last_prior_recidivism_event" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(months_since_last_prior_recidivism_event = NA_real_)
+}
+if (!"num_evictions_prior_to_baseline" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(num_evictions_prior_to_baseline = NA_integer_)
+}
+if (!"eviction_name_match_flag" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(eviction_name_match_flag = NA_integer_)
+}
+if (!"target_recidivated" %in% names(rrh_dataset)) {
+  rrh_dataset <- rrh_dataset %>% mutate(target_recidivated = NA_integer_)
+}
+
+rrh_dataset <- rrh_dataset %>%
+  mutate(
+    target_recidivated = coalesce(target_recidivated, 0L),
+    
+    number_prior_psh_rrh_enrollments = coalesce(number_prior_psh_rrh_enrollments, 0L),
+    long_term_cat1_count = coalesce(long_term_cat1_count, 0L),
+    high_enrollment_flag = coalesce(high_enrollment_flag, 0L),
+    night_by_night = coalesce(night_by_night, 0L),
+    number_of_years_engaged_with_coc = coalesce(number_of_years_engaged_with_coc, 0),
+    count_of_unsheltered_months = coalesce(count_of_unsheltered_months, 0L),
+    count_of_homeless_months = coalesce(count_of_homeless_months, 0L),
+    prior_recidivism_count = coalesce(prior_recidivism_count, 0L),
+    
+    # Flags explicitly indicate whether the event exists
+    has_prior_cat1_enrollment = coalesce(has_prior_cat1_enrollment, 0L),
+    has_prior_recidivism_event = coalesce(has_prior_recidivism_event, 0L),
+    
+    # Keep true month counts if event exists, otherwise leave NA
+    months_since_last_cat1_enrollment = months_since_last_cat1_enrollment,
+    months_since_last_prior_recidivism_event = months_since_last_prior_recidivism_event,
+    
+    num_evictions_prior_to_baseline = coalesce(num_evictions_prior_to_baseline, 0L),
+    eviction_name_match_flag = coalesce(eviction_name_match_flag, 0L)
+  )
+
+###############################################################################
+# 14. STANDARDIZE BASELINE MODELING FIELDS
+###############################################################################
+
+rrh_dataset <- rrh_dataset %>%
+  mutate(
+    disabling_condition = standardize_unknown(disabling_condition),
+    mental_health = standardize_unknown(mental_health),
+    substance_use = standardize_unknown(substance_use),
+    veteran = standardize_unknown(veteran),
+    gender = standardize_unknown(gender),
+    race = standardize_unknown(race)
+  )
+
+###############################################################################
+# 15. OPTIONAL: REORDER COLUMNS
+###############################################################################
+
+rrh_dataset <- rrh_dataset %>%
+  select(
+    clients_unique_identifier,
+    baseline_enrollment_id,
+    baseline_program_name,
+    baseline_project_type,
+    baseline_start_date,
+    baseline_exit_date,
+    client_full_name,
+    
+    target_recidivated,
+    
+    income_change_any,
+    earned_income_change,
+    income_at_exit_earned,
+    income_at_exit_any,
+    num_children,
+    mental_health,
+    substance_use,
+    disabling_condition,
+    age_at_exit,
+    race,
+    gender,
+    veteran,
+    destination,
+    destination_code,
+    rental_subsidy_type,
+    aftercare,
+    
+    number_prior_psh_rrh_enrollments,
+    prior_recidivism_count,
+    has_prior_cat1_enrollment,
+    months_since_last_cat1_enrollment,
+    has_prior_recidivism_event,
+    months_since_last_prior_recidivism_event,
+    long_term_cat1_count,
+    high_enrollment_flag,
+    night_by_night,
+    number_of_years_engaged_with_coc,
+    count_of_unsheltered_months,
+    count_of_homeless_months,
+    
+    num_evictions_prior_to_baseline,
+    eviction_name_match_flag
+  )
+
+###############################################################################
+# 16. QA CHECKS
+###############################################################################
+
+# One row per client
+rrh_dataset %>%
+  summarise(
+    rows = n(),
+    unique_clients = n_distinct(clients_unique_identifier)
+  ) %>%
+  print()
+
+# Target counts
+rrh_dataset %>%
+  count(target_recidivated) %>%
+  print()
+
+# Aftercare counts
+rrh_dataset %>%
+  count(aftercare) %>%
+  print()
+
+# Recency flag counts
+rrh_dataset %>%
+  count(has_prior_cat1_enrollment) %>%
+  print()
+
+rrh_dataset %>%
+  count(has_prior_recidivism_event) %>%
+  print()
+
+# Recency missingness check
+rrh_dataset %>%
+  summarise(
+    n_missing_months_since_last_cat1 = sum(is.na(months_since_last_cat1_enrollment)),
+    n_missing_months_since_last_recid = sum(is.na(months_since_last_prior_recidivism_event))
+  ) %>%
+  print()
+
+# Eviction summary
+rrh_dataset %>%
+  summarise(
+    clients_with_eviction_match = sum(eviction_name_match_flag, na.rm = TRUE),
+    total_prior_evictions = sum(num_evictions_prior_to_baseline, na.rm = TRUE),
+    max_prior_evictions = max(num_evictions_prior_to_baseline, na.rm = TRUE)
+  ) %>%
+  print()
+
+# Baseline date range check
+rrh_dataset %>%
+  summarise(
+    min_baseline_exit = min(baseline_exit_date, na.rm = TRUE),
+    max_baseline_exit = max(baseline_exit_date, na.rm = TRUE)
+  ) %>%
+  print()
+
+# Missingness snapshot
+rrh_dataset %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "n_missing") %>%
+  arrange(desc(n_missing)) %>%
+  print(n = 50)
+
+# Check standardized categorical values
+rrh_dataset %>% count(disabling_condition, sort = TRUE) %>% print()
+rrh_dataset %>% count(mental_health, sort = TRUE) %>% print()
+rrh_dataset %>% count(substance_use, sort = TRUE) %>% print()
+rrh_dataset %>% count(veteran, sort = TRUE) %>% print()
+
+# Quick look
+glimpse(rrh_dataset)
+
+###############################################################################
+# 17. SAVE
+###############################################################################
+
+write_csv(rrh_dataset, "rrh_recidivism_modeling_dataset_2023.csv")
