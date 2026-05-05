@@ -1,0 +1,217 @@
+###############################################################################
+# APPLY MODEL A TO MONTHLY RRH COHORT
+#
+# PURPOSE:
+# Use the already-trained Model A to score a new monthly cohort.
+#
+# IMPORTANT:
+# This script does NOT train or test the model.
+# It applies the saved model workflow to new data.
+###############################################################################
+
+library(tidyverse)
+library(tidymodels)
+library(scales)
+
+tidymodels_prefer()
+
+###############################################################################
+# 1. USER SETTINGS
+###############################################################################
+
+monthly_file <- "January 2023.csv"
+
+trained_model_file <- "model_A_fitted_workflow.rds"
+
+top_pct_to_review <- 0.25
+
+chosen_threshold <- 0.15
+
+###############################################################################
+# 2. LOAD TRAINED MODEL
+###############################################################################
+
+model_A <- readRDS(trained_model_file)
+
+###############################################################################
+# 3. LOAD MONTHLY DATA
+###############################################################################
+
+monthly_raw <- read_csv(monthly_file, show_col_types = FALSE)
+
+###############################################################################
+# 4. CREATE SERVICE ELIGIBILITY FLAG
+###############################################################################
+
+excluded_435_subsidy_types <- c(
+  "RRH or equivalent subsidy",
+  "Permanent Supportive Housing"
+)
+
+monthly_raw <- monthly_raw %>%
+  mutate(
+    destination_code = suppressWarnings(as.numeric(destination_code)),
+    rental_subsidy_type = as.character(rental_subsidy_type),
+    
+    service_eligible = case_when(
+      destination_code %in% c(410, 411, 421) ~ 1L,
+      destination_code == 435 &
+        !rental_subsidy_type %in% excluded_435_subsidy_types ~ 1L,
+      TRUE ~ 0L
+    )
+  )
+
+###############################################################################
+# 5. SELECT SAME FEATURES USED BY MODEL A
+#
+# The new monthly data must contain these columns.
+###############################################################################
+
+monthly_model_data <- monthly_raw %>%
+  select(
+    income_at_exit_earned,
+    income_at_exit_any,
+    num_children,
+    age_at_exit,
+    number_prior_psh_rrh_enrollments,
+    prior_recidivism_count,
+    has_prior_recidivism_event,
+    has_prior_cat1_enrollment,
+    months_since_last_cat1_enrollment,
+    months_since_last_prior_recidivism_event,
+    long_term_cat1_count,
+    number_of_years_engaged_with_coc,
+    count_of_unsheltered_months,
+    count_of_homeless_months,
+    num_evictions_prior_to_baseline,
+    eviction_name_match_flag,
+    income_change_any,
+    earned_income_change,
+    high_enrollment_flag,
+    night_by_night,
+    mental_health,
+    substance_use,
+    disabling_condition,
+    race,
+    gender,
+    veteran,
+    destination_code,
+    rental_subsidy_type,
+    aftercare
+  ) %>%
+  mutate(
+    across(
+      c(
+        has_prior_recidivism_event,
+        has_prior_cat1_enrollment,
+        eviction_name_match_flag,
+        income_change_any,
+        earned_income_change,
+        high_enrollment_flag,
+        night_by_night,
+        mental_health,
+        substance_use,
+        disabling_condition,
+        race,
+        gender,
+        veteran,
+        destination_code,
+        rental_subsidy_type,
+        aftercare
+      ),
+      as.factor
+    )
+  )
+
+###############################################################################
+# 6. SCORE MONTHLY DATA
+###############################################################################
+
+monthly_scores <- predict(model_A, monthly_model_data, type = "prob") %>%
+  bind_cols(monthly_raw) %>%
+  mutate(
+    risk_rank_all = row_number(desc(.pred_Yes)),
+    risk_percentile_all = percent_rank(.pred_Yes),
+    threshold_flag = if_else(.pred_Yes >= chosen_threshold, 1L, 0L)
+  ) %>%
+  arrange(desc(.pred_Yes))
+
+###############################################################################
+# 7. FILTER TO SERVICE-ELIGIBLE CLIENTS AFTER SCORING
+#
+# WHY AFTER SCORING?
+# The model was trained on the full population to learn the broadest risk signal.
+# We apply service eligibility at the decision stage so the final list includes
+# only people we can actually serve.
+###############################################################################
+
+eligible_scores <- monthly_scores %>%
+  filter(service_eligible == 1L) %>%
+  arrange(desc(.pred_Yes)) %>%
+  mutate(
+    risk_rank_eligible = row_number(),
+    n_eligible = n(),
+    top_n_flag = if_else(
+      risk_rank_eligible <= ceiling(n_eligible * top_pct_to_review),
+      1L,
+      0L
+    ),
+    risk_tier = case_when(
+      top_n_flag == 1L ~ "Top Review Group",
+      .pred_Yes >= chosen_threshold ~ "Elevated Risk",
+      TRUE ~ "Standard Monitoring"
+    )
+  )
+
+###############################################################################
+# 8. CREATE FINAL MONTHLY REVIEW LIST
+###############################################################################
+
+monthly_review_list <- eligible_scores %>%
+  filter(top_n_flag == 1L) %>%
+  select(
+    clients_unique_identifier,
+    baseline_enrollment_id,
+    baseline_program_name,
+    baseline_start_date,
+    baseline_exit_date,
+    .pred_Yes,
+    risk_rank_eligible,
+    risk_tier,
+    service_eligible,
+    num_children,
+    destination_code,
+    rental_subsidy_type,
+    prior_recidivism_count,
+    has_prior_recidivism_event,
+    long_term_cat1_count,
+    count_of_homeless_months,
+    count_of_unsheltered_months,
+    num_evictions_prior_to_baseline,
+    eviction_name_match_flag,
+    mental_health,
+    aftercare
+  )
+
+###############################################################################
+# 9. QA OUTPUTS
+###############################################################################
+
+cat("\nMonthly cohort size:", nrow(monthly_raw), "\n")
+cat("Service eligible:", sum(monthly_raw$service_eligible == 1L, na.rm = TRUE), "\n")
+cat("Top review percent:", percent(top_pct_to_review), "\n")
+cat("People on review list:", nrow(monthly_review_list), "\n")
+
+cat("\nRisk score summary for eligible clients:\n")
+print(summary(eligible_scores$.pred_Yes))
+
+cat("\nReview list preview:\n")
+print(monthly_review_list)
+
+###############################################################################
+# 10. SAVE OUTPUTS
+###############################################################################
+
+write_csv(monthly_scores, "monthly_all_scored_clients.csv")
+write_csv(eligible_scores, "monthly_service_eligible_scored_clients.csv")
+write_csv(monthly_review_list, "monthly_top_review_list.csv")
