@@ -1,0 +1,533 @@
+###############################################################################
+# MODEL A: RRH RECIDIVISM MODEL
+# Combined 2019–2023 Dataset
+#
+# Purpose:
+# Predict RRH recidivism and rank clients for Top-N intervention review.
+#
+# ROC AUC tells us whether the model ranks higher-risk clients above lower-risk
+# clients. It does NOT require the default 0.50 classification threshold to work.
+#
+# Because the recidivism event rate is low, usually around 17% in this dataset,
+# a 0.50 threshold is often too strict. Most predicted probabilities will fall
+# below 0.50, so the model may classify everyone as "No" even when ROC AUC is good.
+#
+# Operationally, use:
+# 1. Top-N ranking, preferred
+# 2. A lower threshold selected from CV predictions, if a Yes/No flag is needed
+###############################################################################
+
+
+library(tidyverse)
+library(tidymodels)
+library(vip)
+library(ranger)
+library(scales)
+
+tidymodels_prefer()
+set.seed(123)
+
+###############################################################################
+# 1. LOAD DATA
+###############################################################################
+
+rrh <- read_csv("combined 2019-2023-GPT safe.csv", show_col_types = FALSE) %>%
+  filter(!is.na(target_recidivated)) %>%
+  mutate(
+    target_recidivated = factor(
+      if_else(target_recidivated == 1, "Yes", "No"),
+      levels = c("No", "Yes")
+    )
+  )
+
+
+###############################################################################
+# 2. EVENT RATE CHECK
+###############################################################################
+
+event_rate_tbl <- rrh %>%
+  count(target_recidivated) %>%
+  mutate(pct = n / sum(n))
+
+print(event_rate_tbl)
+
+event_rate_yes <- event_rate_tbl %>%
+  filter(target_recidivated == "Yes") %>%
+  pull(pct)
+
+cat("\nRecidivism event rate:", percent(event_rate_yes, accuracy = 0.1), "\n")
+
+###############################################################################
+# 3. SELECT MODEL FEATURES
+###############################################################################
+
+model_data <- rrh %>%
+  select(
+    target_recidivated,
+    income_at_exit_earned,
+    income_at_exit_any,
+    num_children,
+    age_at_exit,
+    number_prior_psh_rrh_enrollments,
+    prior_recidivism_count,
+    has_prior_recidivism_event,
+    has_prior_cat1_enrollment,
+    months_since_last_cat1_enrollment,
+    months_since_last_prior_recidivism_event,
+    long_term_cat1_count,
+    number_of_years_engaged_with_coc,
+    count_of_unsheltered_months,
+    count_of_homeless_months,
+    num_evictions_prior_to_baseline,
+    eviction_name_match_flag,
+    income_change_any,
+    earned_income_change,
+    high_enrollment_flag,
+    night_by_night,
+    mental_health,
+    substance_use,
+    disabling_condition,
+    race,
+    gender,
+    veteran,
+    destination_code,
+    rental_subsidy_type,
+    aftercare
+  ) %>%
+  mutate(
+    across(
+      c(
+        has_prior_recidivism_event,
+        has_prior_cat1_enrollment,
+        eviction_name_match_flag,
+        income_change_any,
+        earned_income_change,
+        high_enrollment_flag,
+        night_by_night,
+        mental_health,
+        substance_use,
+        disabling_condition,
+        race,
+        gender,
+        veteran,
+        destination_code,
+        rental_subsidy_type,
+        aftercare
+      ),
+      as.factor
+    )
+  )
+
+###############################################################################
+# 4. TRAIN / TEST SPLIT
+###############################################################################
+
+rrh_split <- initial_split(
+  model_data,
+  prop = 0.80,
+  strata = target_recidivated
+)
+
+rrh_train <- training(rrh_split)
+rrh_test  <- testing(rrh_split)
+
+###############################################################################
+# 5. CLASS WEIGHT
+###############################################################################
+
+n_no  <- sum(rrh_train$target_recidivated == "No")
+n_yes <- sum(rrh_train$target_recidivated == "Yes")
+
+yes_weight <- n_no / n_yes
+
+cat("\nTraining class counts:\n")
+cat("No:", n_no, "\n")
+cat("Yes:", n_yes, "\n")
+cat("Yes class weight:", round(yes_weight, 2), "\n")
+
+###############################################################################
+# 6. RECIPE
+###############################################################################
+
+rf_recipe <- recipe(target_recidivated ~ ., data = rrh_train) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE)
+
+###############################################################################
+# 7. MODEL SPECIFICATION
+###############################################################################
+
+rf_spec <- rand_forest(
+  trees = 500,
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine(
+    "ranger",
+    importance = "impurity",
+    probability = TRUE,
+    class.weights = c("No" = 1, "Yes" = yes_weight)
+  ) %>%
+  set_mode("classification")
+
+###############################################################################
+# 8. CROSS-VALIDATION + TUNING
+###############################################################################
+
+rrh_folds <- vfold_cv(
+  rrh_train,
+  v = 5,
+  strata = target_recidivated
+)
+
+rf_wf <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_spec)
+
+rf_grid <- grid_regular(
+  mtry(range = c(2L, 20L)),
+  min_n(range = c(8L, 20L)),
+  levels = 5
+)
+
+metrics_used <- metric_set(
+  roc_auc,
+  accuracy,
+  sens,
+  spec,
+  precision,
+  kap
+)
+
+rf_res <- tune_grid(
+  rf_wf,
+  resamples = rrh_folds,
+  grid = rf_grid,
+  metrics = metrics_used,
+  control = control_grid(save_pred = TRUE)
+)
+
+collect_metrics(rf_res) %>%
+  arrange(.metric, desc(mean)) %>%
+  print(n = 100)
+
+best_rf <- select_best(rf_res, metric = "roc_auc")
+
+cat("\nBest RF parameters:\n")
+print(best_rf)
+
+###############################################################################
+# 9. THRESHOLD TESTING USING CV PREDICTIONS
+###############################################################################
+
+cv_predictions <- collect_predictions(rf_res) %>%
+  inner_join(best_rf, by = names(best_rf))
+
+thresholds_to_try <- c(
+  0.10, 0.125, 0.15, 0.175,
+  0.20, 0.25, 0.30, 0.35,
+  0.40, 0.50
+)
+
+threshold_results_cv <- map_dfr(thresholds_to_try, function(thresh) {
+  
+  preds_thresh <- cv_predictions %>%
+    mutate(
+      pred_class_custom = factor(
+        if_else(.pred_Yes >= thresh, "Yes", "No"),
+        levels = c("No", "Yes")
+      )
+    )
+  
+  tibble(
+    threshold = thresh,
+    accuracy = accuracy(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom
+    )$.estimate,
+    recall = sens(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom,
+      event_level = "second"
+    )$.estimate,
+    specificity = spec(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom,
+      event_level = "second"
+    )$.estimate,
+    precision = precision(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom,
+      event_level = "second"
+    )$.estimate,
+    kappa = kap(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom
+    )$.estimate
+  )
+})
+
+cat("\nCV threshold comparison:\n")
+print(threshold_results_cv)
+
+###############################################################################
+# 10. CHOSEN OPERATING THRESHOLD
+###############################################################################
+
+chosen_threshold <- 0.15
+
+cat("\nChosen threshold:", chosen_threshold, "\n")
+
+###############################################################################
+# 11. FINAL FIT ON TEST SET
+###############################################################################
+
+final_rf_wf <- finalize_workflow(rf_wf, best_rf)
+
+final_fit <- last_fit(
+  final_rf_wf,
+  split = rrh_split,
+  metrics = metrics_used
+)
+
+final_metrics <- collect_metrics(final_fit)
+
+cat("\nFinal test metrics using default .pred_class:\n")
+print(final_metrics)
+
+final_predictions <- collect_predictions(final_fit)
+
+###############################################################################
+# 12. DEFAULT 0.50 CONFUSION MATRIX
+###############################################################################
+
+cat("\nDefault 0.50 threshold confusion matrix:\n")
+
+final_predictions %>%
+  conf_mat(
+    truth = target_recidivated,
+    estimate = .pred_class
+  ) %>%
+  print()
+
+###############################################################################
+# 13. CUSTOM THRESHOLD CONFUSION MATRIX
+###############################################################################
+
+final_predictions_custom <- final_predictions %>%
+  mutate(
+    pred_class_custom = factor(
+      if_else(.pred_Yes >= chosen_threshold, "Yes", "No"),
+      levels = c("No", "Yes")
+    )
+  )
+
+cat("\nCustom threshold confusion matrix:\n")
+
+final_predictions_custom %>%
+  conf_mat(
+    truth = target_recidivated,
+    estimate = pred_class_custom
+  ) %>%
+  print()
+
+###############################################################################
+# 14. CUSTOM THRESHOLD METRICS
+###############################################################################
+
+test_metrics_custom <- tibble(
+  threshold = chosen_threshold,
+  accuracy = accuracy(
+    final_predictions_custom,
+    truth = target_recidivated,
+    estimate = pred_class_custom
+  )$.estimate,
+  recall = sens(
+    final_predictions_custom,
+    truth = target_recidivated,
+    estimate = pred_class_custom,
+    event_level = "second"
+  )$.estimate,
+  specificity = spec(
+    final_predictions_custom,
+    truth = target_recidivated,
+    estimate = pred_class_custom,
+    event_level = "second"
+  )$.estimate,
+  precision = precision(
+    final_predictions_custom,
+    truth = target_recidivated,
+    estimate = pred_class_custom,
+    event_level = "second"
+  )$.estimate,
+  kappa = kap(
+    final_predictions_custom,
+    truth = target_recidivated,
+    estimate = pred_class_custom
+  )$.estimate,
+  roc_auc = roc_auc(
+    final_predictions_custom,
+    truth = target_recidivated,
+    .pred_Yes,
+    event_level = "second"
+  )$.estimate
+)
+
+cat("\nCustom threshold test metrics:\n")
+print(test_metrics_custom)
+
+###############################################################################
+# 15. TEST THRESHOLD COMPARISON
+###############################################################################
+
+threshold_results_test <- map_dfr(thresholds_to_try, function(thresh) {
+  
+  preds_thresh <- final_predictions %>%
+    mutate(
+      pred_class_custom = factor(
+        if_else(.pred_Yes >= thresh, "Yes", "No"),
+        levels = c("No", "Yes")
+      )
+    )
+  
+  tibble(
+    threshold = thresh,
+    accuracy = accuracy(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom
+    )$.estimate,
+    recall = sens(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom,
+      event_level = "second"
+    )$.estimate,
+    specificity = spec(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom,
+      event_level = "second"
+    )$.estimate,
+    precision = precision(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom,
+      event_level = "second"
+    )$.estimate,
+    kappa = kap(
+      preds_thresh,
+      truth = target_recidivated,
+      estimate = pred_class_custom
+    )$.estimate
+  )
+})
+
+cat("\nTest threshold comparison:\n")
+print(threshold_results_test)
+
+###############################################################################
+# 16. TOP-N CAPTURE TABLE
+###############################################################################
+
+ranked <- final_predictions %>%
+  arrange(desc(.pred_Yes)) %>%
+  mutate(risk_rank = row_number())
+
+top_n_results <- tibble(
+  top_pct = c(0.10, 0.20, 0.25, 0.30, 0.40, 0.50)
+) %>%
+  rowwise() %>%
+  mutate(
+    n_reviewed = ceiling(nrow(ranked) * top_pct),
+    captured_recidivators = sum(ranked$target_recidivated[1:n_reviewed] == "Yes"),
+    total_recidivators = sum(ranked$target_recidivated == "Yes"),
+    recall_capture = captured_recidivators / total_recidivators,
+    precision_top_group = captured_recidivators / n_reviewed
+  ) %>%
+  ungroup()
+
+cat("\nTop-N capture results:\n")
+print(top_n_results)
+
+###############################################################################
+# 17. TOP-N CAPTURE CURVE
+###############################################################################
+
+ggplot(top_n_results, aes(x = top_pct, y = recall_capture)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Top-N Capture Curve",
+    subtitle = "Percent of recidivators captured by reviewing highest-risk clients",
+    x = "Percent reviewed",
+    y = "Percent captured"
+  ) +
+  theme_minimal()
+
+###############################################################################
+# 18. PREDICTED PROBABILITY DISTRIBUTION
+###############################################################################
+
+ggplot(final_predictions, aes(x = .pred_Yes, fill = target_recidivated)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  geom_vline(xintercept = 0.50, linetype = "dashed") +
+  geom_vline(xintercept = chosen_threshold, linetype = "dotted") +
+  labs(
+    title = "Predicted Probability Distribution",
+    subtitle = "Dashed = 0.50 threshold; dotted = chosen threshold",
+    x = "Predicted probability of recidivism",
+    y = "Client count",
+    fill = "Actual outcome"
+  ) +
+  theme_minimal()
+
+###############################################################################
+# 19. VARIABLE IMPORTANCE
+###############################################################################
+
+final_rf_fit <- fit(final_rf_wf, data = rrh_train)
+
+rf_engine <- extract_fit_parsnip(final_rf_fit)$fit
+
+vip(rf_engine, num_features = 20)
+
+importance_tbl <- ranger::importance(rf_engine) %>%
+  as.data.frame() %>%
+  rownames_to_column("feature") %>%
+  rename(importance = ".") %>%
+  arrange(desc(importance))
+
+cat("\nVariable importance:\n")
+print(importance_tbl)
+
+###############################################################################
+# 20. SAVE OUTPUTS
+###############################################################################
+
+write_csv(final_metrics, "model_A_final_metrics_default_threshold.csv")
+write_csv(final_predictions, "model_A_test_predictions.csv")
+write_csv(threshold_results_cv, "model_A_cv_threshold_results.csv")
+write_csv(threshold_results_test, "model_A_test_threshold_results.csv")
+write_csv(test_metrics_custom, "model_A_test_metrics_custom_threshold.csv")
+write_csv(top_n_results, "model_A_top_n_results.csv")
+write_csv(importance_tbl, "model_A_variable_importance.csv")
+
+saveRDS(final_rf_wf, "model_A_final_workflow.rds")
+saveRDS(final_fit, "model_A_last_fit.rds")
+
+
+##!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+## Must filter for service eligibility 
+## Figure out how to apply this filter (before top N or After)??
