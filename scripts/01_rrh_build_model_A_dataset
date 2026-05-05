@@ -51,11 +51,11 @@ library(tidyr)
 
 # Baseline RRH exit window
 baseline_start <- as.Date("2023-01-01")
-baseline_end   <- as.Date("2023-12-31")
+baseline_end   <- as.Date("2023-01-31")
 
 # Input files
-main_file      <- "01_Predictive_RRH_Recidivism 2023 Group.csv"
-recid_file     <- "02_Of total clients Cal 2023 - This is who recidivated 2023.csv"
+main_file      <- "RRH Exits to PH - Jan 2023.csv"
+recid_file     <- "01.2023 - Recidivated.csv"
 evictions_file <- "03_evictions_hsc.csv"  
 
 ###############################################################################
