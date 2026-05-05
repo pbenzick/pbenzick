@@ -516,18 +516,24 @@ print(importance_tbl)
 # 20. SAVE OUTPUTS
 ###############################################################################
 
-write_csv(final_metrics, "model_A_final_metrics_default_threshold.csv")
-write_csv(final_predictions, "model_A_test_predictions.csv")
-write_csv(threshold_results_cv, "model_A_cv_threshold_results.csv")
-write_csv(threshold_results_test, "model_A_test_threshold_results.csv")
-write_csv(test_metrics_custom, "model_A_test_metrics_custom_threshold.csv")
-write_csv(top_n_results, "model_A_top_n_results.csv")
-write_csv(importance_tbl, "model_A_variable_importance.csv")
+# write_csv(final_metrics, "model_A_final_metrics_default_threshold.csv")
+# write_csv(final_predictions, "model_A_test_predictions.csv")
+# write_csv(threshold_results_cv, "model_A_cv_threshold_results.csv")
+# write_csv(threshold_results_test, "model_A_test_threshold_results.csv")
+# write_csv(test_metrics_custom, "model_A_test_metrics_custom_threshold.csv")
+# write_csv(top_n_results, "model_A_top_n_results.csv")
+# write_csv(importance_tbl, "model_A_variable_importance.csv")
 
-saveRDS(final_rf_wf, "model_A_final_workflow.rds")
+###############################################################################
+# SAVE MODEL OBJECTS
+#
+# final_rf_wf = finalized workflow, but NOT trained
+# fitted_model_A = trained workflow that can score new data
+###############################################################################
+
+fitted_model_A <- fit(final_rf_wf, data = model_data)
+
+saveRDS(final_rf_wf, "model_A_final_workflow_untrained.rds")
+saveRDS(fitted_model_A, "model_A_fitted_workflow.rds")
 saveRDS(final_fit, "model_A_last_fit.rds")
 
-
-##!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-## Must filter for service eligibility 
-## Figure out how to apply this filter (before top N or After)??
